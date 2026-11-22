@@ -1,6 +1,28 @@
+# Entorno virtual y caché de Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+
+# Secretos y credenciales (NUNCA subir a GitHub)
 .env
+
+# Datos personales locales, respaldos y salidas generadas
+memoria_jarvis.json
+agenda.json
 ultimo_estado.json
-/tmp/
+bitacora_ingenieria_stark.md
+backups/
+investigaciones/
+modelos_3d/
+
+# Archivos temporales y multimedia
+*.log
+*.mp3
+*.wav
+*.mp4
+*.png
+*.jpg
+!assets/*.png
+!assets/*.jpg
