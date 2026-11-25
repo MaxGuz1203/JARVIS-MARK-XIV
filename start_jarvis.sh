@@ -13,6 +13,7 @@ pkill -f "jarvis_hud.py" 2>/dev/null
 
 # Esperar un instante a que GNOME Shell y PipeWire terminen de levantar tras el encendido
 sleep 2
+"$HOME/jarvis/activar_aec.sh" >> /tmp/jarvis_boot.log 2>&1
 
 # Bloquear la pantalla de inmediato al encender la laptop para esperar las 2 palmadas
 sudo -n /usr/bin/loginctl lock-sessions 2>/dev/null

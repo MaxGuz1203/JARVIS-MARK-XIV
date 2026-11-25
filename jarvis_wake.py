@@ -1107,6 +1107,11 @@ def _obtener_estado_y_titulo_spotify() -> tuple[str, str]:
     return estado, titulo
 
 
+def _spotify_esta_sonando() -> bool:
+    estado, _ = _obtener_estado_y_titulo_spotify()
+    return estado == "playing"
+
+
 def reproducir_musica_aleatoria() -> None:
     asegurar_spotify_listo()
     ejecutar_seguro(["playerctl", "--player=spotify", "loop", "Playlist"])
@@ -1883,7 +1888,7 @@ def hablar_y_escuchar_replica_autonoma(texto_iniciativa: str) -> None:
     if wav_rep:
         texto_rep = transcribir_audio_es(wav_rep)
         if texto_rep and len(texto_rep.strip()) >= 2:
-            es_max, score_v, det_v = verificar_hablante(wav_rep)
+            es_max, score_v, det_v = verificar_hablante(wav_rep, musica_activa=_spotify_esta_sonando())
             print(f"[Biometría Réplica]: {det_v} -> '{texto_rep}'")
             if not es_max:
                 resp_inv = responder_a_invitado_sin_privilegios(texto_rep, score_v)
@@ -2055,17 +2060,18 @@ def iniciar_centinela_proactivo() -> None:
     threading.Thread(target=_centinela, daemon=True).start()
 
 
-def grabar_frase_wav(duracion_max: float = 16.0, espera_inicial_max: float = 4.5) -> bytes | None:
+def grabar_frase_wav(duracion_max: float = 10.0, espera_inicial_max: float = 4.5) -> bytes | None:
     block_size = int(SAMPLE_RATE * 0.08)
     bloques_espera = int(espera_inicial_max / 0.08)
     bloques_habla_max = int(duracion_max / 0.08)
 
-    pre_roll = collections.deque(maxlen=8)
+    pre_roll = collections.deque(maxlen=7)
     frames = []
     hablando = False
     bloques_hablados = 0
     silencio_consecutivo = 0
-    historial_base = []
+    historial_base = collections.deque(maxlen=18)
+    pico_habla = 0.0
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=block_size) as stream:
         for i in range(bloques_espera + bloques_habla_max):
@@ -2074,28 +2080,36 @@ def grabar_frase_wav(duracion_max: float = 16.0, espera_inicial_max: float = 4.5
 
             if not hablando:
                 pre_roll.append(datos.copy())
-                if len(historial_base) < 12:
-                    historial_base.append(rms)
+                historial_base.append(rms)
                 if i >= bloques_espera:
                     break
             else:
                 frames.append(datos.copy())
                 bloques_hablados += 1
+                if rms > pico_habla:
+                    pico_habla = rms
 
             base = float(np.median(historial_base)) if historial_base else 0.012
-            umbral_voz = max(0.017, base * 1.45)
+            # Umbral de inicio adaptativo al volumen de fondo (música o silencio)
+            umbral_inicio = max(0.018, base * 1.48)
+            # Umbral de fin de frase: baja respecto al pico de voz para no quedarse trabado con música
+            umbral_fin = max(umbral_inicio * 0.85, base * 1.25, pico_habla * 0.34)
 
-            if rms >= umbral_voz:
-                if not hablando:
+            if not hablando:
+                if rms >= umbral_inicio and len(historial_base) >= 4:
                     if not esta_en_modo_silencio():
                         escribir_estado_hud("ESCUCHANDO", "Captando su frase completa...")
                     frames.extend(pre_roll)
                     hablando = True
-                silencio_consecutivo = 0
-            elif hablando:
-                silencio_consecutivo += 1
-                if bloques_hablados >= 15 and silencio_consecutivo >= 19:
-                    break
+                    pico_habla = rms
+                    silencio_consecutivo = 0
+            else:
+                if rms >= umbral_fin:
+                    silencio_consecutivo = 0
+                else:
+                    silencio_consecutivo += 1
+                    if bloques_hablados >= 12 and silencio_consecutivo >= 14:
+                        break
 
     if not hablando or len(frames) < 6:
         return None
@@ -2134,7 +2148,7 @@ def escuchar_un_comando_directo() -> None:
     if wav_bytes:
         texto = transcribir_audio_es(wav_bytes)
         if texto:
-            es_max, score_v, det_v = verificar_hablante(wav_bytes)
+            es_max, score_v, det_v = verificar_hablante(wav_bytes, musica_activa=_spotify_esta_sonando())
             print(f"[Biometría jv]: {det_v} -> '{texto}'")
             if not es_max:
                 hablar_jarvis(responder_a_invitado_sin_privilegios(texto, score_v))
@@ -2178,7 +2192,7 @@ def bucle_comandos_voz_post_inicio() -> None:
             if pantalla_esta_bloqueada() or candado_voz.locked():
                 time.sleep(1.0)
                 continue
-            wav_bytes = grabar_frase_wav(duracion_max=16.0, espera_inicial_max=4.0)
+            wav_bytes = grabar_frase_wav(duracion_max=8.5, espera_inicial_max=3.5)
             if wav_bytes:
                 texto = transcribir_audio_es(wav_bytes)
                 if not texto:
@@ -2195,10 +2209,24 @@ def bucle_comandos_voz_post_inicio() -> None:
                     continue
 
                 if any(v in texto for v in palabras_disparo):
-                    es_max, score_v, det_v = verificar_hablante(wav_bytes)
+                    es_max, score_v, det_v = verificar_hablante(wav_bytes, musica_activa=_spotify_esta_sonando())
                     print(f"[Voz Detectada] {det_v} -> '{texto}'")
 
-                    # Si es otra persona: si no dijo "Jarvis", ignorar conversación de fondo; si dijo "Jarvis", charlar sin ejecutar nada
+                    # Si había música fuerte o ruido extremo y el puntaje cayó en zona gris, pausar Spotify 2s y confirmar limpio
+                    if (not es_max) and dijo_jarvis and score_v >= 0.48 and _spotify_esta_sonando():
+                        _enviar_metodo_mpris_spotify("Pause")
+                        hablar_jarvis("Pausé un instante la música para confirmar su voz, señor. Repita su orden.", volumen_musica_durante=10, restaurar_al_100=False)
+                        wav_conf = grabar_frase_wav(duracion_max=7.5, espera_inicial_max=4.5)
+                        if wav_conf:
+                            texto_conf = transcribir_audio_es(wav_conf)
+                            es_max, score_v, det_v = verificar_hablante(wav_conf, musica_activa=False)
+                            print(f"[Biometría Re-confirmación Limpia]: {det_v} -> '{texto_conf}'")
+                            if es_max and texto_conf:
+                                texto = texto_conf
+                            else:
+                                _enviar_metodo_mpris_spotify("Play")
+
+                    # Si definitivamente es otra persona: ignorar fondo o responder en Modo Invitado si dijo "Jarvis"
                     if not es_max:
                         if dijo_jarvis:
                             ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
