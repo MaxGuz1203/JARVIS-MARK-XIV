@@ -45,8 +45,9 @@ DIRECTORIO_BASE = Path.home() / "jarvis"
 if str(DIRECTORIO_BASE) not in sys.path:
     sys.path.insert(0, str(DIRECTORIO_BASE))
 
-from jarvis_brain import OrquestadorJarvis, cargar_api_key, generar_con_modelo_activo, generar_curiosidad_visual_espontanea, procesar_replica_directa_autonoma
+from jarvis_brain import OrquestadorJarvis, cargar_api_key, generar_con_modelo_activo, generar_curiosidad_visual_espontanea, procesar_replica_directa_autonoma, responder_a_invitado_sin_privilegios
 from jarvis_hud import escribir_estado_hud, leer_estado_hud_actual
+from jarvis_voice_id import verificar_hablante
 from jarvis_memory import (
     depurar_y_actualizar_todo_el_contexto,
     escanear_contexto_mensajeria_y_web,
@@ -1041,22 +1042,28 @@ def ajustar_volumen_spotify(porcentaje: int) -> None:
 # =====================================================================
 # 5. MOTOR SPOTIFY INFALIBLE MARK XV (INICIO Y CANCIONES ESPECÍFICAS)
 # =====================================================================
-def asegurar_spotify_listo() -> None:
+def asegurar_spotify_listo() -> bool:
+    """Inicia Spotify si está cerrado y espera hasta que el bus MPRIS responda correctamente."""
     spotify_activo = any("spotify" in (p.info["name"] or "").lower() for p in psutil.process_iter(["name"]))
+    recien_abierto = False
     if not spotify_activo:
+        recien_abierto = True
         if shutil.which("spotify"):
             subprocess.Popen(["spotify"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         elif shutil.which("flatpak"):
             subprocess.Popen(["flatpak", "run", "com.spotify.Client"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
-    for _ in range(32):
+    for _ in range(45):
         try:
             out = subprocess.check_output(["playerctl", "-l"], text=True, stderr=subprocess.DEVNULL)
             if "spotify" in out.lower():
-                break
+                if recien_abierto:
+                    time.sleep(2.2)  # Esperar a que la sesión interna de Spotify termine de cargar
+                return True
         except Exception:
             pass
-        time.sleep(0.35)
+        time.sleep(0.4)
+    return False
 
 
 def _enviar_metodo_mpris_spotify(metodo: str) -> bool:
@@ -1073,6 +1080,33 @@ def _enviar_metodo_mpris_spotify(metodo: str) -> bool:
     return ok1 or ok2
 
 
+def abrir_uri_spotify_infalible(uri: str) -> bool:
+    """Abre cualquier URI de Spotify (track o playlist) corrigiendo el formato GVariant y playerctl."""
+    ok1 = ejecutar_seguro(["playerctl", "--player=spotify", "open", uri])
+    # En gdbus, los strings con ':' DEBEN llevar comillas simples internas para ser GVariant válidos
+    ok2 = ejecutar_seguro([
+        "gdbus", "call", "--session",
+        "--dest", "org.mpris.MediaPlayer2.spotify",
+        "--object-path", "/org/mpris/MediaPlayer2",
+        "--method", "org.mpris.MediaPlayer2.Player.OpenUri",
+        f"'{uri}'",
+    ])
+    return ok1 or ok2
+
+
+def _obtener_estado_y_titulo_spotify() -> tuple[str, str]:
+    estado, titulo = "", ""
+    try:
+        estado = subprocess.check_output(["playerctl", "--player=spotify", "status"], text=True, stderr=subprocess.DEVNULL).strip().lower()
+    except Exception:
+        pass
+    try:
+        titulo = subprocess.check_output(["playerctl", "--player=spotify", "metadata", "title"], text=True, stderr=subprocess.DEVNULL).strip().lower()
+    except Exception:
+        pass
+    return estado, titulo
+
+
 def reproducir_musica_aleatoria() -> None:
     asegurar_spotify_listo()
     ejecutar_seguro(["playerctl", "--player=spotify", "loop", "Playlist"])
@@ -1084,36 +1118,26 @@ def reproducir_musica_aleatoria() -> None:
 def _pasar_a_rework_aleatorio() -> None:
     ejecutar_seguro(["playerctl", "--player=spotify", "loop", "Playlist"])
     ejecutar_seguro(["playerctl", "--player=spotify", "shuffle", "On"])
-    time.sleep(0.15)
-    ejecutar_seguro([
-        "gdbus", "call", "--session",
-        "--dest", "org.mpris.MediaPlayer2.spotify",
-        "--object-path", "/org/mpris/MediaPlayer2",
-        "--method", "org.mpris.MediaPlayer2.Player.OpenUri",
-        PLAYLIST_REWORK_URI,
-    ])
-    time.sleep(0.8)
+    time.sleep(0.2)
+    abrir_uri_spotify_infalible(PLAYLIST_REWORK_URI)
+    time.sleep(0.9)
     ejecutar_seguro(["playerctl", "--player=spotify", "shuffle", "On"])
     _enviar_metodo_mpris_spotify("Play")
-    time.sleep(0.35)
-    try:
-        t_act = subprocess.check_output(["playerctl", "--player=spotify", "metadata", "title"], text=True, stderr=subprocess.DEVNULL).strip().lower()
-        if "should i stay" in t_act:
-            _enviar_metodo_mpris_spotify("Next")
-    except Exception:
-        pass
+    time.sleep(0.45)
+    _, t_act = _obtener_estado_y_titulo_spotify()
+    if "should i stay" in t_act:
+        _enviar_metodo_mpris_spotify("Next")
 
 
 def _vigilar_transicion_should_i_stay() -> None:
-    time.sleep(5.0)
+    time.sleep(6.0)
     ya_avanzo = False
     while True:
         time.sleep(1.5)
         try:
-            titulo = subprocess.check_output(
-                ["playerctl", "--player=spotify", "metadata", "title"],
-                text=True, stderr=subprocess.DEVNULL,
-            ).strip().lower()
+            estado, titulo = _obtener_estado_y_titulo_spotify()
+            if not titulo:
+                continue
 
             if "should i stay" not in titulo:
                 ejecutar_seguro(["playerctl", "--player=spotify", "loop", "Playlist"])
@@ -1126,37 +1150,50 @@ def _vigilar_transicion_should_i_stay() -> None:
             ).strip()
             pos = float(pos_str)
 
-            if pos > 35.0:
+            if pos > 30.0:
                 ya_avanzo = True
 
-            if pos >= 184.0 or (ya_avanzo and pos < 12.0):
+            if pos >= 183.0 or (ya_avanzo and pos < 12.0) or (ya_avanzo and estado == "stopped"):
                 _pasar_a_rework_aleatorio()
                 break
         except Exception:
             break
 
 
-def iniciar_rework_en_spotify(volumen_inicial: int = 100) -> None:
+def iniciar_rework_en_spotify(volumen_inicial: int = 100) -> bool:
+    """
+    GARANTÍA ABSOLUTA DE INICIO MUSICAL:
+    Abre Spotify, fuerza 'Should I Stay or Should I Go' desde 0:00 y verifica activamente
+    que el estado sea 'Playing' antes de regresar el control para que la música suene SIEMPRE antes de la voz.
+    """
     asegurar_spotify_listo()
     ajustar_volumen_sistema(VOLUMEN_SISTEMA_MAX)
     ajustar_volumen_spotify(volumen_inicial)
 
     ejecutar_seguro(["playerctl", "--player=spotify", "loop", "Playlist"])
     ejecutar_seguro(["playerctl", "--player=spotify", "shuffle", "Off"])
-    time.sleep(0.25)
 
-    ejecutar_seguro([
-        "gdbus", "call", "--session",
-        "--dest", "org.mpris.MediaPlayer2.spotify",
-        "--object-path", "/org/mpris/MediaPlayer2",
-        "--method", "org.mpris.MediaPlayer2.Player.OpenUri",
-        SHOULD_I_STAY_URI,
-    ])
-    time.sleep(0.65)
-    _enviar_metodo_mpris_spotify("Play")
-    ajustar_volumen_spotify(volumen_inicial)
+    confirmado = False
+    for intento in range(1, 11):
+        abrir_uri_spotify_infalible(SHOULD_I_STAY_URI)
+        time.sleep(0.85)
+        _enviar_metodo_mpris_spotify("Play")
+        ajustar_volumen_spotify(volumen_inicial)
+        time.sleep(0.55)
+
+        estado, titulo = _obtener_estado_y_titulo_spotify()
+        if estado == "playing" and "should i stay" in titulo:
+            confirmado = True
+            break
+
+        # Respaldo en intentos 4 y 7 si Spotify recién abrió y no tomó foco MPRIS
+        if intento in (4, 7) and shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", SHOULD_I_STAY_URI], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(1.5)
+            _enviar_metodo_mpris_spotify("Play")
 
     threading.Thread(target=_vigilar_transicion_should_i_stay, daemon=True).start()
+    return confirmado
 
 
 def _buscar_uri_cancion_en_web(consulta: str) -> tuple[str, str]:
@@ -1215,14 +1252,8 @@ def reproducir_cancion_especifica_spotify(nombre_cancion: str) -> str:
     )
 
     if track_uri:
-        ejecutar_seguro([
-            "gdbus", "call", "--session",
-            "--dest", "org.mpris.MediaPlayer2.spotify",
-            "--object-path", "/org/mpris/MediaPlayer2",
-            "--method", "org.mpris.MediaPlayer2.Player.OpenUri",
-            track_uri,
-        ])
-        time.sleep(0.5)
+        abrir_uri_spotify_infalible(track_uri)
+        time.sleep(0.55)
         _enviar_metodo_mpris_spotify("Play")
         ajustar_volumen_spotify(100)
         return sintetizar_respuesta_unica_contextual(
@@ -1231,13 +1262,7 @@ def reproducir_cancion_especifica_spotify(nombre_cancion: str) -> str:
             False,
         )
 
-    ejecutar_seguro([
-        "gdbus", "call", "--session",
-        "--dest", "org.mpris.MediaPlayer2.spotify",
-        "--object-path", "/org/mpris/MediaPlayer2",
-        "--method", "org.mpris.MediaPlayer2.Player.OpenUri",
-        f"spotify:search:{urllib.parse.quote(limpio)}",
-    ])
+    abrir_uri_spotify_infalible(f"spotify:search:{urllib.parse.quote(limpio)}")
     time.sleep(1.2)
     _enviar_metodo_mpris_spotify("Play")
     return sintetizar_respuesta_unica_contextual(
@@ -1261,11 +1286,7 @@ def controlar_musica_por_voz(comando_usuario: str) -> str:
         asegurar_spotify_listo()
         _enviar_metodo_mpris_spotify("Next")
         time.sleep(0.35)
-        titulo_nuevo = ""
-        try:
-            titulo_nuevo = subprocess.check_output(["playerctl", "--player=spotify", "metadata", "title"], text=True, stderr=subprocess.DEVNULL).strip()
-        except Exception:
-            pass
+        _, titulo_nuevo = _obtener_estado_y_titulo_spotify()
         det = f"Cambiando a la siguiente pista de su playlist ({titulo_nuevo})." if titulo_nuevo else "Cambiando a la siguiente canción en Spotify."
         escribir_estado_hud("EN LÍNEA", f"🎵 Pista actual: {titulo_nuevo or 'Siguiente'}", visible=True, efecto_transicion="PORTAL")
         return sintetizar_respuesta_unica_contextual(comando_usuario, det, False)
@@ -1285,9 +1306,6 @@ def controlar_musica_por_voz(comando_usuario: str) -> str:
     return reproducir_cancion_especifica_spotify(comando_usuario)
 
 
-# =====================================================================
-# 6. GESTIÓN DE VENTANAS Y APERTURA DE APLICACIONES (ONSHAPE, CANVA, LATEX)
-# =====================================================================
 def buscar_lanzador_desktop(keywords: list[str]) -> Path | None:
     directorios = [
         Path.home() / ".local/share/applications",
@@ -1853,10 +1871,6 @@ FRASES_REGRESO_LABORATORIO = [
 
 
 def hablar_y_escuchar_replica_autonoma(texto_iniciativa: str) -> None:
-    """
-    Habla por iniciativa propia y, apenas termina de hablar, abre el micrófono automáticamente
-    durante 6 segundos para que Max pueda contestarle SIN tener que decir 'Jarvis'.
-    """
     hablar_jarvis(texto_iniciativa, volumen_musica_durante=22, restaurar_al_100=False)
     escribir_estado_hud(
         "ESCUCHANDO",
@@ -1869,12 +1883,16 @@ def hablar_y_escuchar_replica_autonoma(texto_iniciativa: str) -> None:
     if wav_rep:
         texto_rep = transcribir_audio_es(wav_rep)
         if texto_rep and len(texto_rep.strip()) >= 2:
-            print(f"[Réplica Directa de Max]: {texto_rep}")
+            es_max, score_v, det_v = verificar_hablante(wav_rep)
+            print(f"[Biometría Réplica]: {det_v} -> '{texto_rep}'")
+            if not es_max:
+                resp_inv = responder_a_invitado_sin_privilegios(texto_rep, score_v)
+                hablar_jarvis(resp_inv, volumen_musica_durante=22, restaurar_al_100=True)
+                return
             respuesta_seguimiento = procesar_replica_directa_autonoma(sys.modules[__name__], texto_iniciativa, texto_rep)
             hablar_jarvis(respuesta_seguimiento, volumen_musica_durante=22, restaurar_al_100=True)
             return
 
-    # Si Max no respondió nada en 5.5s, restaurar la música suavemente
     escribir_estado_hud("EN LÍNEA", "Mark XVI en línea | Autonomía activa", visible=True)
     for vol in (75, 90, VOLUMEN_MUSICA_FINAL_PCT):
         ajustar_volumen_spotify(vol)
@@ -2107,16 +2125,20 @@ def escuchar_un_comando_directo() -> None:
     lanzar_hud_holografico()
     ajustar_volumen_spotify(25)
     saludo_corto = elegir_frase_sin_repetir(
-        [f"Lo escucho, {NOMBRE_USUARIO}.", f"Dígame, {NOMBRE_USUARIO}.", f"Adelante, Max, estoy atento.", f"A sus órdenes, {NOMBRE_USUARIO}."],
+        [f"Lo escucho, {NOMBRE_USUARIO}.", f"Dígame, {NOMBRE_USUARIO}.", "Adelante, Max, estoy atento.", f"A sus órdenes, {NOMBRE_USUARIO}."],
         "ultimo_saludo_jv",
     )
     hablar_jarvis(saludo_corto, volumen_musica_durante=20, restaurar_al_100=False)
-    escribir_estado_hud("ESCUCHANDO", "Hable con calma, escucho su frase completa...")
+    escribir_estado_hud("ESCUCHANDO", "Hable con calma, verificando firma vocal...")
     wav_bytes = grabar_frase_wav(duracion_max=16.0, espera_inicial_max=6.0)
     if wav_bytes:
         texto = transcribir_audio_es(wav_bytes)
         if texto:
-            print(f"[Instrucción Completa]: {texto}")
+            es_max, score_v, det_v = verificar_hablante(wav_bytes)
+            print(f"[Biometría jv]: {det_v} -> '{texto}'")
+            if not es_max:
+                hablar_jarvis(responder_a_invitado_sin_privilegios(texto, score_v))
+                return
             respuesta, _ = cerebro.procesar_instruccion(texto)
             hablar_jarvis(respuesta)
             return
@@ -2127,7 +2149,7 @@ def bucle_comandos_voz_post_inicio() -> None:
     cerebro = OrquestadorJarvis(sys.modules[__name__])
     lanzar_hud_holografico(animacion="NORMAL", fullscreen=False)
     iniciar_centinela_proactivo()
-    escribir_estado_hud("EN LÍNEA", "Mark XV en línea | 1 Clic Reactor: Fullscreen", fullscreen=False)
+    escribir_estado_hud("EN LÍNEA", "Mark XVI en línea | Biometría Vocal Activa", fullscreen=False)
 
     palabras_disparo = (
         "jarvis", "yarvis", "háblame", "hablame", "estás despierto", "estas despierto",
@@ -2162,19 +2184,33 @@ def bucle_comandos_voz_post_inicio() -> None:
                 if not texto:
                     continue
 
+                dijo_jarvis = any(j in texto for j in ("jarvis", "yarvis"))
+
                 if esta_en_modo_silencio():
-                    if any(w in texto for w in palabras_despertar_silencio) and any(j in texto for j in ("jarvis", "yarvis")):
-                        resp = establecer_modo_silencio_suma(False)
-                        hablar_jarvis(resp)
+                    if any(w in texto for w in palabras_despertar_silencio) and dijo_jarvis:
+                        es_max, _, _ = verificar_hablante(wav_bytes)
+                        if es_max:
+                            resp = establecer_modo_silencio_suma(False)
+                            hablar_jarvis(resp)
                     continue
 
                 if any(v in texto for v in palabras_disparo):
-                    print(f"[Voz Detectada]: {texto}")
+                    es_max, score_v, det_v = verificar_hablante(wav_bytes)
+                    print(f"[Voz Detectada] {det_v} -> '{texto}'")
+
+                    # Si es otra persona: si no dijo "Jarvis", ignorar conversación de fondo; si dijo "Jarvis", charlar sin ejecutar nada
+                    if not es_max:
+                        if dijo_jarvis:
+                            ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
+                            resp_inv = responder_a_invitado_sin_privilegios(texto, score_v)
+                            hablar_jarvis(resp_inv)
+                        continue
+
                     ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
                     limpio = texto.replace("jarvis", "").replace("yarvis", "").strip(" ,.")
                     if len(limpio) < 3:
                         prompt_c = elegir_frase_sin_repetir(
-                            [f"Dígame, {NOMBRE_USUARIO}.", f"A sus órdenes, Max.", f"Lo escucho, {NOMBRE_USUARIO}."],
+                            [f"Dígame, {NOMBRE_USUARIO}.", "A sus órdenes, Max.", f"Lo escucho, {NOMBRE_USUARIO}."],
                             "ultimo_prompt_corto",
                         )
                         hablar_jarvis(prompt_c, volumen_musica_durante=20, restaurar_al_100=False)
@@ -2182,6 +2218,11 @@ def bucle_comandos_voz_post_inicio() -> None:
                         if wav2:
                             texto2 = transcribir_audio_es(wav2)
                             if texto2:
+                                es_max_2, score_2, det_2 = verificar_hablante(wav2)
+                                print(f"[Biometría 2do Turno]: {det_2} -> '{texto2}'")
+                                if not es_max_2:
+                                    hablar_jarvis(responder_a_invitado_sin_privilegios(texto2, score_2))
+                                    continue
                                 texto = texto2
                     respuesta, seguir = cerebro.procesar_instruccion(texto)
                     if "?" in respuesta and seguir:
@@ -2191,7 +2232,7 @@ def bucle_comandos_voz_post_inicio() -> None:
                     if not seguir:
                         break
                 else:
-                    escribir_estado_hud("EN LÍNEA", "Mark XV en línea | 1 Clic Reactor: Fullscreen")
+                    escribir_estado_hud("EN LÍNEA", "Mark XVI en línea | Biometría Vocal Activa")
         except Exception:
             time.sleep(1.5)
 
@@ -2391,6 +2432,8 @@ if __name__ == "__main__":
         establecer_modo_silencio_suma(True)
     elif len(sys.argv) > 1 and sys.argv[1] == "--unmute":
         establecer_modo_silencio_suma(False)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-spotify":
+        ejecutar_protocolo_inicio()
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-autonomia":
         lanzar_hud_holografico()
         obs = generar_curiosidad_visual_espontanea()

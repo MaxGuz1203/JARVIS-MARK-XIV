@@ -26,3 +26,4 @@ modelos_3d/
 *.jpg
 !assets/*.png
 !assets/*.jpg
+voz_max.json
