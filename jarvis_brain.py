@@ -50,6 +50,24 @@ from jarvis_memory import (
     sintetizar_respuesta_unica_contextual,
 )
 
+_GENAI_CLIENT_BRAIN = {}
+_MODELO_RAPIDO_BRAIN = None
+_MODELOS_CANDIDATOS_BRAIN = (
+    "models/gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+)
+
+
+def obtener_cliente_gemini_rapido(api_key: str):
+    if api_key not in _GENAI_CLIENT_BRAIN:
+        from google import genai
+        _GENAI_CLIENT_BRAIN[api_key] = genai.Client(api_key=api_key)
+    return _GENAI_CLIENT_BRAIN[api_key]
+
 DIRECTORIO_BASE = Path.home() / "jarvis"
 ARCHIVO_ENV = DIRECTORIO_BASE / ".env"
 MODELO_ACTIVO_CACHE = None
@@ -91,7 +109,7 @@ def cargar_api_key() -> str:
     return ""
 
 
-def generar_con_modelo_activo(client, contents, config=None):
+def _generar_con_modelo_activo_base(client, contents, config=None):
     global MODELO_ACTIVO_CACHE
     if MODELO_ACTIVO_CACHE:
         try:
@@ -244,7 +262,7 @@ def analizar_imagen_con_gemini(ruta_imagen: Path, pregunta_usuario: str) -> str:
         return "Señor, capturé la imagen pero requiero la clave de Gemini en el archivo punto env."
     try:
         from google import genai
-        client = genai.Client(api_key=api_key)
+        client = obtener_cliente_gemini_rapido(api_key)
         imagen_pil = Image.open(ruta_imagen)
         # Redimensionar suavemente si es 4K para respuesta rápida manteniendo nitidez de textos
         imagen_pil.thumbnail((1920, 1080))
@@ -321,7 +339,7 @@ def ejecutar_investigacion_profunda(tema: str) -> str:
     if api_key:
         try:
             from google import genai
-            client = genai.Client(api_key=api_key)
+            client = obtener_cliente_gemini_rapido(api_key)
             prompt_dossier = (
                 f"Actúa como J.A.R.V.I.S. asistiendo a Luis Maximiliano Guzmán Ortiz (Ingeniería Eléctrica Electrónica, FI UNAM).\n"
                 f"Realiza una investigación técnica rigurosa, clara y profunda en español sobre: '{tema}'.\n"
@@ -465,7 +483,7 @@ def generar_curiosidad_visual_espontanea() -> str:
     if ruta and api_key:
         try:
             from google import genai
-            client = genai.Client(api_key=api_key)
+            client = obtener_cliente_gemini_rapido(api_key)
             imagen_pil = Image.open(ruta)
             imagen_pil.thumbnail((1600, 900))
             frases_previas = obtener_historial_frases_dichas()[-10:]
@@ -547,7 +565,7 @@ def responder_a_invitado_sin_privilegios(texto_invitado: str, similitud: float =
     if api_key:
         try:
             from google import genai
-            client = genai.Client(api_key=api_key)
+            client = obtener_cliente_gemini_rapido(api_key)
             prompt = (
                 f"Eres J.A.R.V.I.S., el asistente personal creado por Max (Luis Maximiliano Guzmán Ortiz). "
                 f"La persona que te acaba de hablar NO es Max (la verificación biométrica de tono de voz dio negativo). "
@@ -869,7 +887,7 @@ class OrquestadorJarvis:
             mem_context = json.dumps(depurar_y_actualizar_todo_el_contexto(), ensure_ascii=False)
             frases_prohibidas = obtener_historial_frases_dichas()[-10:]
             turnos_recientes = " | ".join(f"Max: '{t['max']}' -> Jarvis: '{t['jarvis']}'" for t in list(HISTORIAL_CONVERSACION)[-5:])
-            client = genai.Client(api_key=api_key)
+            client = obtener_cliente_gemini_rapido(api_key)
             config = types.GenerateContentConfig(
                 system_instruction=(
                     SYSTEM_PROMPT_JARVIS
@@ -885,3 +903,146 @@ class OrquestadorJarvis:
             return salida, True
         except Exception:
             return self.sys.elegir_frase_sin_repetir(self.sys.FRASES_LEALTAD, "ultima_lealtad"), True
+
+
+def generar_con_modelo_activo(client, *args, **kwargs):
+    global _MODELO_RAPIDO_BRAIN
+    contents = kwargs.get("contents", args[0] if args else None)
+    config = kwargs.get("config", args[1] if len(args) > 1 else None)
+    if contents is not None:
+        call_kw = {"contents": contents}
+        if config is not None:
+            call_kw["config"] = config
+        orden = ([_MODELO_RAPIDO_BRAIN] if _MODELO_RAPIDO_BRAIN else []) + [
+            m for m in _MODELOS_CANDIDATOS_BRAIN if m != _MODELO_RAPIDO_BRAIN
+        ]
+        for mod in orden:
+            try:
+                res = client.models.generate_content(model=mod, **call_kw)
+                _MODELO_RAPIDO_BRAIN = mod
+                return res
+            except Exception:
+                continue
+    return _generar_con_modelo_activo_base(client, *args, **kwargs)
+
+
+# =====================================================================
+# FASE 2 PYTORCH: ENRUTADOR NEURONAL DE INTENCIONES (JarvisIntentNet)
+# =====================================================================
+try:
+    from jarvis_intent_net import (
+        predecir_intencion_texto as _predecir_intencion_nn,
+        normalizar_texto_intent as _norm_intent_nn,
+    )
+except Exception:
+    def _predecir_intencion_nn(_texto):
+        return None
+    def _norm_intent_nn(t):
+        return str(t or "").lower()
+
+
+def _enrutar_frase_con_intent_net(texto_original: str) -> str:
+    """
+    Si el usuario formula una orden natural sin las palabras clave rígidas,
+    JarvisIntentNet (PyTorch) identifica la intención con alta confianza y la enlaza
+    al subsistema correcto sin alterar ninguna función existente.
+    """
+    res = _predecir_intencion_nn(texto_original)
+    if not res:
+        return texto_original
+
+    intencion = res["intencion"]
+    conf = res["confianza"]
+    margen = res["margen"]
+    t_norm = _norm_intent_nn(texto_original)
+    print(f"[PyTorch IntentNet {res['latencia_ms']}ms] {intencion} (conf={conf*100:.1f}%, margen={margen*100:.1f}%)")
+
+    if intencion == "conversacion_general":
+        return texto_original
+
+    # Umbral de seguridad extra alto para apagado del sistema
+    if intencion == "apagar_sistema":
+        if conf >= 0.92 and margen >= 0.55 and not any(k in t_norm for k in ("apaga la laptop", "apaga el sistema")):
+            return f"apaga la laptop ({texto_original})"
+        return texto_original
+
+    # Para el resto de herramientas exigimos confianza >= 76% y margen >= 25%
+    if conf < 0.76 or margen < 0.25:
+        return texto_original
+
+    if intencion == "vision_pantalla":
+        if not any(k in t_norm for k in ("pantalla", "analiza este codigo")):
+            return f"dime qué se muestra en mi pantalla y responde esto: {texto_original}"
+
+    elif intencion == "modelo_3d":
+        if not any(k in t_norm for k in ("modelo 3d", "en 3d", "holograma")):
+            return f"proyecta un modelo 3d de: {texto_original}"
+
+    elif intencion == "dossier_investigacion":
+        if "investiga" not in t_norm:
+            return f"investiga a fondo {texto_original}"
+
+    elif intencion == "musica_control":
+        if not any(k in t_norm for k in ("pausa", "siguiente", "anterior", "cambia la cancion", "cambia de cancion")):
+            if any(k in t_norm for k in ("otra", "rola", "salta", "adelanta", "sigue", "cambia")):
+                return "siguiente canción"
+            if any(k in t_norm for k in ("atras", "regresa", "pasada", "antes")):
+                return "canción anterior"
+            return "pausa la música"
+
+    elif intencion == "musica_reproducir":
+        if not any(k in t_norm for k in ("spotify", "reproduce", "pon musica", "rework")):
+            return f"pon música: {texto_original}"
+
+    elif intencion == "classroom_memoria":
+        if not any(k in t_norm for k in ("classroom", "gmail", "correo", "memoria", "recuerda", "ya entregue")):
+            if any(k in t_norm for k in ("entregue", "termine", "subi", "acabe", "hecho", "complet")):
+                return f"ya entregué: {texto_original}"
+            return f"revisa mis pendientes de classroom: {texto_original}"
+
+    elif intencion == "grabacion_clips":
+        if not any(k in t_norm for k in ("clipea", "graba mi pantalla", "caja negra", "deten la grabacion")):
+            if any(k in t_norm for k in ("deten", "para", "termina", "corta")):
+                return "detén la grabación"
+            return "clipea esto"
+
+    elif intencion == "hardware_energia":
+        if not any(k in t_norm for k in ("ahorro de bateria", "teclado", "ventiladores", "estado del sistema")):
+            if any(k in t_norm for k in ("pila", "bateria", "ahorra", "aguante", "dure")):
+                return "activa ahorro de batería"
+            if any(k in t_norm for k in ("teclado", "luces", "luz")):
+                return f"luz del teclado: {texto_original}"
+            return f"dime el estado del sistema: {texto_original}"
+
+    elif intencion == "modo_silencio":
+        if not any(k in t_norm for k in ("modo silencio", "no me molestes", "despierta")):
+            if any(k in t_norm for k in ("sal", "vuelve", "termine", "acabe", "hablar", "reactiva", "desactiva")):
+                return "despierta del modo silencio"
+            return "activa el modo silencio"
+
+    elif intencion == "seguridad_red":
+        if not any(k in t_norm for k in ("intrusos", "vigila mi laptop", "mi red", "modo sigilo")):
+            if any(k in t_norm for k in ("wifi", "router", "internet", "dispositivos", "equipos", "ips")):
+                return "quién está en mi red"
+            return "vigila mi laptop"
+
+    elif intencion == "abrir_apps_ventanas":
+        if not any(k in t_norm for k in ("abre", "abrir", "acomoda", "pizarra limpia", "pantalla completa", "cierra tod")):
+            if any(k in t_norm for k in ("mosaico", "divide", "organiza", "cuadrantes")):
+                return "acomoda las ventanas"
+            if any(k in t_norm for k in ("limpia", "quita todas", "cerrar")):
+                return "pizarra limpia"
+            return f"abre {texto_original}"
+
+    return texto_original
+
+
+if not getattr(OrquestadorJarvis, "_intent_net_activada", False):
+    _orig_procesar_instruccion_base = OrquestadorJarvis.procesar_instruccion
+
+    def _procesar_instruccion_con_intent_net(self, texto_usuario: str, *args, **kwargs):
+        texto_enrutado = _enrutar_frase_con_intent_net(texto_usuario)
+        return _orig_procesar_instruccion_base(self, texto_enrutado, *args, **kwargs)
+
+    OrquestadorJarvis.procesar_instruccion = _procesar_instruccion_con_intent_net
+    OrquestadorJarvis._intent_net_activada = True

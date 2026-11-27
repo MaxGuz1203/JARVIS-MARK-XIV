@@ -51,12 +51,29 @@ import concurrent.futures
 import speech_recognition as _sr_fast
 from jarvis_voice_id import verificar_hablante
 try:
-    from jarvis_neural_core import predecir_ventana_audio, info_nucleo_neuronal
+    from jarvis_neural_core import (
+        predecir_ventana_audio,
+        analizar_clip_wav_con_cnn,
+        calentar_gpu_audio,
+        info_nucleo_neuronal,
+    )
 except Exception:
     def predecir_ventana_audio(_audio):
         return None
+    def analizar_clip_wav_con_cnn(_wav):
+        return None
+    def calentar_gpu_audio():
+        return None
     def info_nucleo_neuronal():
         return "Modo DSP clásico"
+
+try:
+    from jarvis_intent_net import predecir_intencion_texto, calentar_gpu_intent
+except Exception:
+    def predecir_intencion_texto(_texto):
+        return None
+    def calentar_gpu_intent():
+        return None
 
 from jarvis_tts_fast import hablar_en_pipeline
 from jarvis_memory import (
@@ -2218,13 +2235,16 @@ def escuchar_un_comando_directo() -> None:
 def bucle_comandos_voz_post_inicio() -> None:
     cerebro = OrquestadorJarvis(sys.modules[__name__])
     lanzar_hud_holografico(animacion="NORMAL", fullscreen=False)
+    calentar_gpu_audio()
+    calentar_gpu_intent()
     iniciar_centinela_proactivo()
-    escribir_estado_hud("EN LÍNEA", "Mark XIV Turbo | Biometría Vocal Activa", fullscreen=False)
+    escribir_estado_hud("EN LÍNEA", "Mark XIV Neural | AudioCNN + Biometría v4", fullscreen=False)
 
     palabras_disparo = (
-        "jarvis", "yarvis", "háblame", "hablame", "estás despierto", "estas despierto",
-        "estás ahí", "estas ahi", "demostración", "demostracion", "demuestra",
-        "investiga", "apaga la laptop", "apaga el sistema", "cierra todas", "cierra todo",
+        "jarvis", "yarvis", "charvis", "harvis", "yarbis", "háblame", "hablame",
+        "estás despierto", "estas despierto", "estás ahí", "estas ahi",
+        "demostración", "demostracion", "demuestra", "investiga",
+        "apaga la laptop", "apaga el sistema", "cierra todas", "cierra todo",
         "pizarra limpia", "acomoda", "protocolo", "fiesta en casa", "bitácora", "bitacora",
         "modo sigilo", "correo", "gmail", "classroom", "recuerda", "memoria", "pantalla completa",
         "ventanas completas", "maximiza", "soren", "alessa", "modo silencio", "no me molestes",
@@ -2248,7 +2268,10 @@ def bucle_comandos_voz_post_inicio() -> None:
         "nada más", "nada mas", "listo gracias", "hasta luego", "nos vemos", "ahí déjalo",
     )
 
-    palabras_musica_activa = ("pon musica", "pon música", "reproduce", "siguiente", "cambia de canción", "cambia de cancion", "cambia la canción", "cambia la cancion", "rework")
+    palabras_musica_activa = (
+        "pon musica", "pon música", "reproduce", "siguiente",
+        "cambia de canción", "cambia de cancion", "cambia la canción", "cambia la cancion", "rework",
+    )
 
     VENTANA_CONVERSACION_S = 12.0
     conversacion_hasta = 0.0
@@ -2268,7 +2291,7 @@ def bucle_comandos_voz_post_inicio() -> None:
                 musica_atenuada_por_charla = False
                 ultimo_fue_invitado = False
                 _restaurar_spotify_suave_async()
-                escribir_estado_hud("EN LÍNEA", "Mark XIV Turbo | Biometría Vocal Activa")
+                escribir_estado_hud("EN LÍNEA", "Mark XIV Neural | AudioCNN + Biometría v4")
 
             espera_mic = 4.2 if en_conversacion else 3.0
             wav_bytes = grabar_frase_wav(duracion_max=9.0, espera_inicial_max=espera_mic)
@@ -2278,11 +2301,23 @@ def bucle_comandos_voz_post_inicio() -> None:
                     conversacion_hasta = 0.0
                 continue
 
+            # COMPUERTA LOCAL PYTORCH (~1.5 ms en GPU) ANTES DE LLAMAR A GOOGLE STT
+            res_cnn = analizar_clip_wav_con_cnn(wav_bytes)
+            if res_cnn and res_cnn["descartar_local"]:
+                if (not en_conversacion) or res_cnn["mean_ruido"] >= 0.80:
+                    print(f"[PyTorch Gate {res_cnn['latencia_ms']}ms] Ignorado local: {res_cnn['motivo_descarte']}")
+                    continue
+
+            cnn_voz_max = bool(res_cnn and res_cnn["detecto_voz_max"])
+            cnn_conf_voz = float(res_cnn["confianza_voz_max"]) if res_cnn else 0.0
+
             texto, es_max, score_v, det_v, mus_sonando = _analizar_audio_en_paralelo(wav_bytes)
             if not texto:
                 continue
 
-            dijo_jarvis = any(j in texto for j in ("jarvis", "yarvis"))
+            # Si Google STT cortó o transcribió mal "Jarvis" en una llamada breve, voz_max_jarvis la rescata
+            dijo_jarvis_txt = any(j in texto for j in ("jarvis", "yarvis", "charvis", "harvis", "yarbis"))
+            dijo_jarvis = dijo_jarvis_txt or (cnn_voz_max and cnn_conf_voz >= 0.88 and len(texto.split()) <= 3)
 
             if esta_en_modo_silencio():
                 if any(w in texto for w in palabras_despertar_silencio) and dijo_jarvis and es_max:
@@ -2290,14 +2325,23 @@ def bucle_comandos_voz_post_inicio() -> None:
                     hablar_jarvis(resp)
                 continue
 
-            activar_turno = en_conversacion or any(v in texto for v in palabras_disparo)
+            # Activación por conversación, palabra de disparo, o combinación AudioCNN (voz_max_jarvis) + IntentNet
+            activar_por_nn = False
+            if cnn_voz_max and cnn_conf_voz >= 0.78 and es_max:
+                res_int = predecir_intencion_texto(texto)
+                if res_int and res_int["intencion"] != "conversacion_general" and res_int["confianza"] >= 0.80 and res_int["margen"] >= 0.30:
+                    activar_por_nn = True
+
+            activar_turno = en_conversacion or dijo_jarvis or activar_por_nn or any(v in texto for v in palabras_disparo)
             if not activar_turno:
                 continue
 
-            print(f"[Voz {'CHARLA' if en_conversacion else 'DISPARO'}] {det_v} -> '{texto}'")
+            etq_cnn = f" | CNN_VozMax={cnn_conf_voz*100:.0f}%({res_cnn['latencia_ms']}ms)" if res_cnn else ""
+            print(f"[Voz {'CHARLA' if en_conversacion else 'DISPARO'}] {det_v}{etq_cnn} -> '{texto}'")
 
-            # Re-confirmación rápida si Spotify estaba muy fuerte y cayó en zona dudosa
-            if (not es_max) and (dijo_jarvis or (en_conversacion and not ultimo_fue_invitado)) and score_v >= 0.48 and mus_sonando:
+            # Re-confirmación rápida si Spotify estaba fuerte y cayó en zona gris (apoyada por voz_max_jarvis)
+            umbral_zona_gris = 0.42 if cnn_voz_max else 0.48
+            if (not es_max) and (dijo_jarvis or (en_conversacion and not ultimo_fue_invitado)) and score_v >= umbral_zona_gris and mus_sonando:
                 _enviar_metodo_mpris_spotify("Pause")
                 hablar_jarvis("Pausé un segundo la música para confirmar su voz. Dígame.", volumen_musica_durante=10, restaurar_al_100=False)
                 time.sleep(0.12)
@@ -2310,9 +2354,9 @@ def bucle_comandos_voz_post_inicio() -> None:
                     else:
                         _enviar_metodo_mpris_spotify("Play")
 
-            # BLOQUEO ESTRICTO PARA OTRAS PERSONAS (solo charla, jamás comandos del sistema)
+            # BLOQUEO ESTRICTO PARA OTRAS PERSONAS (Modo Invitado sin privilegios)
             if not es_max:
-                if dijo_jarvis or (en_conversacion and ultimo_fue_invitado):
+                if dijo_jarvis_txt or (en_conversacion and ultimo_fue_invitado):
                     ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
                     resp_inv = responder_a_invitado_sin_privilegios(texto, score_v)
                     hablar_jarvis(resp_inv, volumen_musica_durante=VOLUMEN_MUSICA_COMANDO_PCT, restaurar_al_100=False)
@@ -2326,15 +2370,18 @@ def bucle_comandos_voz_post_inicio() -> None:
             ultimo_fue_invitado = False
             ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
 
-            # Si Max se despide de la charla actual, cerrar ventana fluida de inmediato
             if en_conversacion and any(c in texto for c in palabras_cierre_charla) and len(texto.split()) <= 5:
                 conversacion_hasta = 0.0
                 musica_atenuada_por_charla = False
                 hablar_jarvis("A sus órdenes, señor. Aquí sigo pendiente.", restaurar_al_100=True)
                 continue
 
-            limpio = texto.replace("jarvis", "").replace("yarvis", "").strip(" ,.")
-            if len(limpio) < 3:
+            limpio = texto
+            for w_alias in ("jarvis", "yarvis", "charvis", "harvis", "yarbis"):
+                limpio = limpio.replace(w_alias, "")
+            limpio = limpio.strip(" ,.")
+
+            if len(limpio) < 3 and dijo_jarvis:
                 prompt_c = elegir_frase_sin_repetir(
                     [f"Dígame, {NOMBRE_USUARIO}.", "A sus órdenes, Max.", "Lo escucho, señor."],
                     "ultimo_prompt_corto",
@@ -2365,6 +2412,7 @@ def bucle_comandos_voz_post_inicio() -> None:
 
         except Exception:
             time.sleep(0.5)
+
 
 
 
@@ -2648,6 +2696,29 @@ def probar_velocidad_respuesta() -> None:
     print("============================================================\n")
 
 
+
+def probar_compuerta_neuronal() -> None:
+    calentar_gpu_audio()
+    print("\n============================================================")
+    print("  PRUEBA DE COMPUERTA LOCAL PYTORCH (AudioCNN) — Ctrl+C salir")
+    print("============================================================")
+    print("Haz silencio, golpea la mesa, aplaude o di 'Jarvis, hola' para ver qué pasa a STT y qué se descarta en GPU:\n")
+    while True:
+        wav = grabar_frase_wav(duracion_max=6.0, espera_inicial_max=4.0)
+        if not wav:
+            continue
+        res = analizar_clip_wav_con_cnn(wav)
+        if not res:
+            print("[!] Sin modelo AudioCNN entrenado.")
+            return
+        accion = "DESCARTADO LOCAL (0 tráfico STT)" if res["descartar_local"] else "PASA A STT + BIOMETRÍA"
+        print(
+            f"[{res['dispositivo'].upper()} {res['latencia_ms']:4.1f}ms | {res['ventanas']} win | {res['duracion_s']}s] "
+            f"VozMax={res['confianza_voz_max']*100:4.1f}% | Ruido={res['mean_ruido']*100:4.1f}% | "
+            f"Clap={res['max_palmada']*100:4.1f}% | Falso={res['max_falso']*100:4.1f}%  --> {accion}"
+        )
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--listen-once":
         escuchar_un_comando_directo()
@@ -2664,6 +2735,8 @@ if __name__ == "__main__":
         establecer_modo_silencio_suma(False)
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-velocidad":
         probar_velocidad_respuesta()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-wake-nn":
+        probar_compuerta_neuronal()
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-palmadas":
         probar_detector_palmadas()
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-spotify":

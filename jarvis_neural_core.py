@@ -2,12 +2,14 @@
 """
 J.A.R.V.I.S. - Núcleo Neuronal Real en PyTorch (Módulo 1: JarvisAudioCNN)
 - Red Neuronal Convolucional 2D sobre Espectrogramas Log-Mel de doble canal (forma + energía).
-- Implementación 100% en PyTorch + NumPy (sin dependencias frágiles de torchaudio/librosa).
-- Aceleración automática en GPU NVIDIA (CUDA) con fallback transparente a CPU.
+- Soporta inferencia en ventana única (palmadas) y análisis por lotes de clips WAV (escucha continua).
+- Calentamiento CUDA automático para eliminar el retraso de la primera inferencia.
 Autor: Luis Maximiliano Guzmán Ortiz (Max)
 """
 
+import io
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -86,7 +88,6 @@ class LogMelDualExtractor(nn.Module):
         mel = torch.matmul(self.mel_fb, power).clamp(min=1e-7)
         log_mel = torch.log(mel)
 
-        # Canal 0: forma espectral normalizada | Canal 1: nivel absoluto de energía
         media = log_mel.mean(dim=(1, 2), keepdim=True)
         std = log_mel.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
         ch_forma = (log_mel - media) / std
@@ -95,7 +96,7 @@ class LogMelDualExtractor(nn.Module):
 
 
 class JarvisAudioCNN(nn.Module):
-    """Red Neuronal Convolucional 2D (~68k parámetros) para eventos acústicos de J.A.R.V.I.S."""
+    """Red Neuronal Convolucional 2D (~77.5k parámetros) para eventos acústicos de J.A.R.V.I.S."""
 
     def __init__(self, num_clases: int = len(CLASES_AUDIO)):
         super().__init__()
@@ -126,7 +127,6 @@ class JarvisAudioCNN(nn.Module):
         )
 
     def _spec_augment(self, x: torch.Tensor) -> torch.Tensor:
-        """Enmascara aleatoriamente 1 banda de frecuencia y 1 de tiempo durante entrenamiento."""
         b, _, f_dim, t_dim = x.shape
         x = x.clone()
         for i in range(b):
@@ -155,6 +155,7 @@ class _MotorInferenciaAudio:
         self.dispositivo = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.mtime_cargado = 0.0
         self.val_acc = 0.0
+        self._calentado = False
 
     def _cargar_si_necesario(self) -> bool:
         if not RUTA_MODELO_AUDIO.exists():
@@ -172,10 +173,18 @@ class _MotorInferenciaAudio:
             self.clases = clases
             self.mtime_cargado = mtime
             self.val_acc = float(ckpt.get("val_acc", 0.0))
+            self._calentado = False
             return True
         except Exception:
             self.modelo = None
             return False
+
+    def calentar(self) -> None:
+        if self._cargar_si_necesario() and not self._calentado:
+            with torch.no_grad():
+                dummy = torch.zeros((1, MUESTRAS_VENTANA), dtype=torch.float32, device=self.dispositivo)
+                _ = self.modelo(dummy, aplicar_spec_augment=False)
+            self._calentado = True
 
     def predecir(self, audio_float32: np.ndarray) -> dict | None:
         if not self._cargar_si_necesario():
@@ -183,8 +192,7 @@ class _MotorInferenciaAudio:
         t0 = time.perf_counter()
         arr = np.asarray(audio_float32, dtype=np.float32).reshape(-1)
         if len(arr) < MUESTRAS_VENTANA:
-            pad = np.zeros(MUESTRAS_VENTANA - len(arr), dtype=np.float32)
-            arr = np.concatenate([pad, arr])
+            arr = np.concatenate([np.zeros(MUESTRAS_VENTANA - len(arr), dtype=np.float32), arr])
         elif len(arr) > MUESTRAS_VENTANA:
             arr = arr[-MUESTRAS_VENTANA:]
 
@@ -203,13 +211,116 @@ class _MotorInferenciaAudio:
             "latencia_ms": round(lat_ms, 2),
         }
 
+    def analizar_clip_wav(self, wav_bytes: bytes) -> dict | None:
+        """
+        Evalúa un clip WAV completo en 1 solo batch de GPU con ventanas solapadas de 1.0 s (paso 0.5 s).
+        Permite descartar ruido/palmadas/golpes secos en <2 ms antes de llamar a Google STT y detectar voz_max_jarvis.
+        """
+        if not self._cargar_si_necesario():
+            return None
+        t0 = time.perf_counter()
+        try:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                sr = wf.getframerate()
+                n_ch = wf.getnchannels()
+                raw = wf.readframes(wf.getnframes())
+        except Exception:
+            return None
+
+        sig = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if n_ch > 1:
+            sig = sig.reshape(-1, n_ch).mean(axis=1)
+        if len(sig) < 1600:
+            return None
+
+        if sr != SAMPLE_RATE_NN:
+            n_nuevo = int(round(len(sig) * SAMPLE_RATE_NN / float(sr)))
+            sig = np.interp(np.linspace(0, len(sig) - 1, n_nuevo), np.arange(len(sig)), sig).astype(np.float32)
+
+        duracion_s = len(sig) / float(SAMPLE_RATE_NN)
+        ventanas = []
+        if len(sig) <= MUESTRAS_VENTANA:
+            pad = np.zeros(MUESTRAS_VENTANA - len(sig), dtype=np.float32)
+            ventanas.append(np.concatenate([pad, sig]))
+        else:
+            hop = MUESTRAS_VENTANA // 2  # 0.5 s
+            for ini in range(0, len(sig) - MUESTRAS_VENTANA + 1, hop):
+                ventanas.append(sig[ini : ini + MUESTRAS_VENTANA])
+                if len(ventanas) >= 12:
+                    break
+            if (len(sig) - MUESTRAS_VENTANA) % hop != 0 and len(ventanas) < 13:
+                ventanas.append(sig[-MUESTRAS_VENTANA:])
+
+        batch_np = np.stack(ventanas, axis=0)
+        batch_t = torch.from_numpy(batch_np).to(self.dispositivo)
+        with torch.no_grad():
+            logits = self.modelo(batch_t, aplicar_spec_augment=False)
+            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+
+        mapa = {c: i for i, c in enumerate(self.clases)}
+        i_ruido = mapa.get("ruido_ambiente", 0)
+        i_clap = mapa.get("palmada", 1)
+        i_voz = mapa.get("voz_max_jarvis", 2)
+        i_falso = mapa.get("falso_golpe_o_voz", 3)
+
+        mean_ruido = float(np.mean(probs[:, i_ruido]))
+        max_clap = float(np.max(probs[:, i_clap]))
+        max_voz = float(np.max(probs[:, i_voz]))
+        max_falso = float(np.max(probs[:, i_falso]))
+
+        # Calcular duración ACTIVA real (sin contar los ~0.95 s de pre-roll y silencio final del VAD)
+        blk_20 = 320
+        n_b = len(sig) // blk_20
+        if n_b > 0:
+            rms_b = np.sqrt(np.mean(sig[: n_b * blk_20].reshape(n_b, blk_20) ** 2, axis=1))
+            umb_act = max(0.014, float(np.percentile(rms_b, 95)) * 0.22)
+            duracion_activa_s = float(np.sum(rms_b >= umb_act)) * 0.02
+        else:
+            duracion_activa_s = duracion_s
+
+        # Compuerta local: descarta ruido, palmadas sueltas o golpes secos cortos (act<=0.48 s),
+        # pero deja pasar frases completas de amigos (act>0.48 s) para conservar el Modo Invitado.
+        descartar = False
+        motivo = "voz_o_habla_detectada"
+        if mean_ruido >= 0.65 and max_voz < 0.18 and max_falso < 0.30:
+            descartar = True
+            motivo = f"ruido_ambiente({mean_ruido*100:.0f}%)"
+        elif max_clap >= 0.70 and max_voz < 0.28 and duracion_activa_s <= 0.50:
+            descartar = True
+            motivo = f"palmada_suelta({max_clap*100:.0f}%, act={duracion_activa_s:.2f}s)"
+        elif max_falso >= 0.74 and max_voz < 0.55 and duracion_activa_s <= 0.48:
+            descartar = True
+            motivo = f"golpe_breve({max_falso*100:.0f}%, act={duracion_activa_s:.2f}s)"
+
+        lat_ms = (time.perf_counter() - t0) * 1000.0
+        return {
+            "descartar_local": descartar,
+            "motivo_descarte": motivo,
+            "detecto_voz_max": max_voz >= 0.68,
+            "confianza_voz_max": max_voz,
+            "max_palmada": max_clap,
+            "mean_ruido": mean_ruido,
+            "max_falso": max_falso,
+            "ventanas": len(ventanas),
+            "duracion_s": round(duracion_s, 2),
+            "dispositivo": str(self.dispositivo),
+            "latencia_ms": round(lat_ms, 2),
+        }
+
 
 _MOTOR_AUDIO = _MotorInferenciaAudio()
 
 
+def calentar_gpu_audio() -> None:
+    _MOTOR_AUDIO.calentar()
+
+
 def predecir_ventana_audio(audio_float32: np.ndarray) -> dict | None:
-    """Ejecuta inferencia en PyTorch sobre 1.0 s de audio (16 kHz). Devuelve None si aún no está entrenado."""
     return _MOTOR_AUDIO.predecir(audio_float32)
+
+
+def analizar_clip_wav_con_cnn(wav_bytes: bytes) -> dict | None:
+    return _MOTOR_AUDIO.analizar_clip_wav(wav_bytes)
 
 
 def info_nucleo_neuronal() -> str:
