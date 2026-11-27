@@ -27,3 +27,6 @@ modelos_3d/
 !assets/*.png
 !assets/*.jpg
 voz_max.json
+.tts_cache/
+dataset_nn/
+modelos_nn/

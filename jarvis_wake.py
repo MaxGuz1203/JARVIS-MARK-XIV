@@ -47,7 +47,18 @@ if str(DIRECTORIO_BASE) not in sys.path:
 
 from jarvis_brain import OrquestadorJarvis, cargar_api_key, generar_con_modelo_activo, generar_curiosidad_visual_espontanea, procesar_replica_directa_autonoma, responder_a_invitado_sin_privilegios
 from jarvis_hud import escribir_estado_hud, leer_estado_hud_actual
+import concurrent.futures
+import speech_recognition as _sr_fast
 from jarvis_voice_id import verificar_hablante
+try:
+    from jarvis_neural_core import predecir_ventana_audio, info_nucleo_neuronal
+except Exception:
+    def predecir_ventana_audio(_audio):
+        return None
+    def info_nucleo_neuronal():
+        return "Modo DSP clásico"
+
+from jarvis_tts_fast import hablar_en_pipeline
 from jarvis_memory import (
     depurar_y_actualizar_todo_el_contexto,
     escanear_contexto_mensajeria_y_web,
@@ -290,13 +301,13 @@ GANANCIA_VOZ_TTS = "+60%"
 
 SAMPLE_RATE = 16000
 BLOCK_DURATION = 0.04
-CLAP_THRESHOLD = 0.35
-SILENCE_THRESHOLD = 0.12
-CREST_FACTOR_MIN = 5.0
-MAX_CLAP_BLOCKS = 3
-MIN_SILENCE_BLOCKS = 3
-MIN_GAP_SECONDS = 0.18
-MAX_GAP_SECONDS = 0.65
+CLAP_THRESHOLD = 0.22
+SILENCE_THRESHOLD = 0.14
+CREST_FACTOR_MIN = 3.6
+MAX_CLAP_BLOCKS = 6
+MIN_SILENCE_BLOCKS = 2
+MIN_GAP_SECONDS = 0.14
+MAX_GAP_SECONDS = 0.85
 
 BLOQUEAR_AL_ARRANCAR = True
 candado_voz = threading.Lock()
@@ -1024,7 +1035,8 @@ def ajustar_volumen_sistema(porcentaje: int) -> None:
 
 
 def ajustar_volumen_spotify(porcentaje: int) -> None:
-    decimal = max(0.0, min(1.0, porcentaje / 100.0))
+    porcentaje = max(0, min(100, int(porcentaje)))
+    decimal = porcentaje / 100.0
     ejecutar_seguro(["playerctl", "--player=spotify", "volume", f"{decimal:.2f}"])
     if shutil.which("pactl"):
         try:
@@ -1034,6 +1046,7 @@ def ajustar_volumen_spotify(porcentaje: int) -> None:
             for bloque in salida.split("Sink Input #")[1:]:
                 if "spotify" in bloque.lower():
                     sink_id = bloque.splitlines()[0].strip()
+                    ejecutar_seguro(["pactl", "set-sink-input-mute", sink_id, "0"])
                     ejecutar_seguro(["pactl", "set-sink-input-volume", sink_id, f"{porcentaje}%"])
         except Exception:
             pass
@@ -1843,14 +1856,34 @@ async def hablar_jarvis_async(texto: str, volumen_musica_durante: int = VOLUMEN_
     escribir_estado_hud("EN LÍNEA", texto)
 
 
-def hablar_jarvis(texto: str, volumen_musica_durante: int = VOLUMEN_MUSICA_COMANDO_PCT, restaurar_al_100: bool = True) -> None:
+_VOZ_TTS_TURBO = "es-MX-JorgeNeural"
+
+
+def _restaurar_spotify_suave_async() -> None:
+    def _job():
+        for vol in (75, 92, VOLUMEN_MUSICA_FINAL_PCT):
+            if candado_voz.locked():
+                return
+            ajustar_volumen_spotify(vol)
+            time.sleep(0.08)
+    threading.Thread(target=_job, daemon=True).start()
+
+
+def hablar_jarvis(texto: str, volumen_musica_durante: int = 20, restaurar_al_100: bool = True) -> None:
+    if not texto or not str(texto).strip():
+        return
+    texto_limpio = str(texto).replace("*", "").replace("#", "").strip()
     with candado_voz:
-        print(f"\n[J.A.R.V.I.S.]: {texto}\n")
-        asyncio.run(hablar_jarvis_async(texto, volumen_musica_durante))
-        if restaurar_al_100:
-            for vol in (75, 90, VOLUMEN_MUSICA_FINAL_PCT):
-                ajustar_volumen_spotify(vol)
-                time.sleep(0.12)
+        ajustar_volumen_spotify(volumen_musica_durante)
+        escribir_estado_hud("HABLANDO", texto_limpio[:190], visible=True)
+        try:
+            hablar_en_pipeline(texto_limpio, voz=_VOZ_TTS_TURBO, rate="+9%")
+        except Exception:
+            pass
+        escribir_estado_hud("EN LÍNEA", "Mark XIV Turbo | Conversación fluida", visible=True)
+    if restaurar_al_100:
+        _restaurar_spotify_suave_async()
+
 
 
 def iniciar_temporizador_estudio(minutos: int) -> None:
@@ -2060,45 +2093,45 @@ def iniciar_centinela_proactivo() -> None:
     threading.Thread(target=_centinela, daemon=True).start()
 
 
-def grabar_frase_wav(duracion_max: float = 10.0, espera_inicial_max: float = 4.5) -> bytes | None:
-    block_size = int(SAMPLE_RATE * 0.08)
-    bloques_espera = int(espera_inicial_max / 0.08)
-    bloques_habla_max = int(duracion_max / 0.08)
+def grabar_frase_wav(duracion_max: float = 9.0, espera_inicial_max: float = 3.5) -> bytes | None:
+    dur_blk = 0.05
+    block_size = int(SAMPLE_RATE * dur_blk)
+    bloques_espera = max(1, int(espera_inicial_max / dur_blk))
+    bloques_habla_max = max(1, int(duracion_max / dur_blk))
 
-    pre_roll = collections.deque(maxlen=7)
+    pre_roll = collections.deque(maxlen=10)
     frames = []
     hablando = False
     bloques_hablados = 0
     silencio_consecutivo = 0
-    historial_base = collections.deque(maxlen=18)
+    historial_base = collections.deque(maxlen=16)
     pico_habla = 0.0
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=block_size) as stream:
         for i in range(bloques_espera + bloques_habla_max):
             datos, _ = stream.read(block_size)
-            rms = float(np.sqrt(np.mean(np.square(datos))))
+            arr = datos.reshape(-1).astype(np.float32)
+            rms = float(np.sqrt(np.mean(arr * arr)))
 
             if not hablando:
-                pre_roll.append(datos.copy())
+                pre_roll.append(arr.copy())
                 historial_base.append(rms)
                 if i >= bloques_espera:
                     break
             else:
-                frames.append(datos.copy())
+                frames.append(arr.copy())
                 bloques_hablados += 1
                 if rms > pico_habla:
                     pico_habla = rms
 
-            base = float(np.median(historial_base)) if historial_base else 0.012
-            # Umbral de inicio adaptativo al volumen de fondo (música o silencio)
-            umbral_inicio = max(0.018, base * 1.48)
-            # Umbral de fin de frase: baja respecto al pico de voz para no quedarse trabado con música
-            umbral_fin = max(umbral_inicio * 0.85, base * 1.25, pico_habla * 0.34)
+            base = float(np.median(historial_base)) if historial_base else 0.008
+            umbral_inicio = max(0.013, base * 1.50)
+            umbral_fin = max(umbral_inicio * 0.78, base * 1.22, pico_habla * 0.28)
 
             if not hablando:
-                if rms >= umbral_inicio and len(historial_base) >= 4:
+                if rms >= umbral_inicio and len(historial_base) >= 3:
                     if not esta_en_modo_silencio():
-                        escribir_estado_hud("ESCUCHANDO", "Captando su frase completa...")
+                        escribir_estado_hud("ESCUCHANDO", "Escuchando...")
                     frames.extend(pre_roll)
                     hablando = True
                     pico_habla = rms
@@ -2108,10 +2141,11 @@ def grabar_frase_wav(duracion_max: float = 10.0, espera_inicial_max: float = 4.5
                     silencio_consecutivo = 0
                 else:
                     silencio_consecutivo += 1
-                    if bloques_hablados >= 12 and silencio_consecutivo >= 14:
+                    # Cierra en 0.45 s tras terminar de hablar (antes 1.12 s)
+                    if bloques_hablados >= 6 and silencio_consecutivo >= 9:
                         break
 
-    if not hablando or len(frames) < 6:
+    if not hablando or len(frames) < 5:
         return None
 
     audio_int16 = np.clip(np.concatenate(frames, axis=0) * 32767, -32768, 32767).astype(np.int16)
@@ -2124,31 +2158,52 @@ def grabar_frase_wav(duracion_max: float = 10.0, espera_inicial_max: float = 4.5
     return buffer_wav.getvalue()
 
 
+
+_STT_RECOGNIZER = _sr_fast.Recognizer()
+_STT_RECOGNIZER.operation_timeout = 4.5
+_POOL_VOZ_PARALELO = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+
+
 def transcribir_audio_es(wav_bytes: bytes) -> str:
-    reconocedor = sr.Recognizer()
-    reconocedor.dynamic_energy_threshold = False
-    with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
-        try:
-            return reconocedor.recognize_google(reconocedor.record(source), language="es-MX").lower().strip()
-        except Exception:
-            return ""
+    try:
+        with _sr_fast.AudioFile(io.BytesIO(wav_bytes)) as src:
+            audio = _STT_RECOGNIZER.record(src)
+        return _STT_RECOGNIZER.recognize_google(audio, language="es-MX").strip().lower()
+    except Exception:
+        return ""
+
+
+def _analizar_audio_en_paralelo(wav_bytes: bytes) -> tuple[str, bool, float, str, bool]:
+    """Ejecuta STT y Biometría Vocal v4 al mismo tiempo (0 ms de retraso adicional)."""
+    fut_stt = _POOL_VOZ_PARALELO.submit(transcribir_audio_es, wav_bytes)
+
+    def _bio_job():
+        mus = _spotify_esta_sonando()
+        es_m, sc, det = verificar_hablante(wav_bytes, musica_activa=mus)
+        return es_m, sc, det, mus
+
+    fut_bio = _POOL_VOZ_PARALELO.submit(_bio_job)
+    texto = fut_stt.result()
+    es_max, score_v, det_v, mus_activa = fut_bio.result()
+    return texto, es_max, score_v, det_v, mus_activa
+
 
 
 def escuchar_un_comando_directo() -> None:
     cerebro = OrquestadorJarvis(sys.modules[__name__])
     lanzar_hud_holografico()
-    ajustar_volumen_spotify(25)
+    ajustar_volumen_spotify(22)
     saludo_corto = elegir_frase_sin_repetir(
-        [f"Lo escucho, {NOMBRE_USUARIO}.", f"Dígame, {NOMBRE_USUARIO}.", "Adelante, Max, estoy atento.", f"A sus órdenes, {NOMBRE_USUARIO}."],
+        [f"Lo escucho, {NOMBRE_USUARIO}.", f"Dígame, {NOMBRE_USUARIO}.", "Adelante, Max.", f"A sus órdenes, {NOMBRE_USUARIO}."],
         "ultimo_saludo_jv",
     )
     hablar_jarvis(saludo_corto, volumen_musica_durante=20, restaurar_al_100=False)
-    escribir_estado_hud("ESCUCHANDO", "Hable con calma, verificando firma vocal...")
-    wav_bytes = grabar_frase_wav(duracion_max=16.0, espera_inicial_max=6.0)
+    time.sleep(0.12)
+    escribir_estado_hud("ESCUCHANDO", "Hable ahora...")
+    wav_bytes = grabar_frase_wav(duracion_max=12.0, espera_inicial_max=5.0)
     if wav_bytes:
-        texto = transcribir_audio_es(wav_bytes)
+        texto, es_max, score_v, det_v, _ = _analizar_audio_en_paralelo(wav_bytes)
         if texto:
-            es_max, score_v, det_v = verificar_hablante(wav_bytes, musica_activa=_spotify_esta_sonando())
             print(f"[Biometría jv]: {det_v} -> '{texto}'")
             if not es_max:
                 hablar_jarvis(responder_a_invitado_sin_privilegios(texto, score_v))
@@ -2156,14 +2211,15 @@ def escuchar_un_comando_directo() -> None:
             respuesta, _ = cerebro.procesar_instruccion(texto)
             hablar_jarvis(respuesta)
             return
-    hablar_jarvis(f"No detecté ninguna instrucción en el canal de audio, {NOMBRE_USUARIO}.")
+    hablar_jarvis(f"No detecté ninguna instrucción, {NOMBRE_USUARIO}.")
+
 
 
 def bucle_comandos_voz_post_inicio() -> None:
     cerebro = OrquestadorJarvis(sys.modules[__name__])
     lanzar_hud_holografico(animacion="NORMAL", fullscreen=False)
     iniciar_centinela_proactivo()
-    escribir_estado_hud("EN LÍNEA", "Mark XVI en línea | Biometría Vocal Activa", fullscreen=False)
+    escribir_estado_hud("EN LÍNEA", "Mark XIV Turbo | Biometría Vocal Activa", fullscreen=False)
 
     palabras_disparo = (
         "jarvis", "yarvis", "háblame", "hablame", "estás despierto", "estas despierto",
@@ -2187,82 +2243,129 @@ def bucle_comandos_voz_post_inicio() -> None:
         "ya termine la clase", "actívate", "activate", "sal del modo silencio", "reactívate",
     )
 
+    palabras_cierre_charla = (
+        "gracias jarvis", "muchas gracias", "eso es todo", "sería todo", "seria todo",
+        "nada más", "nada mas", "listo gracias", "hasta luego", "nos vemos", "ahí déjalo",
+    )
+
+    palabras_musica_activa = ("pon musica", "pon música", "reproduce", "siguiente", "cambia de canción", "cambia de cancion", "cambia la canción", "cambia la cancion", "rework")
+
+    VENTANA_CONVERSACION_S = 12.0
+    conversacion_hasta = 0.0
+    ultimo_fue_invitado = False
+    musica_atenuada_por_charla = False
+
     while True:
         try:
             if pantalla_esta_bloqueada() or candado_voz.locked():
-                time.sleep(1.0)
+                time.sleep(0.4)
                 continue
-            wav_bytes = grabar_frase_wav(duracion_max=8.5, espera_inicial_max=3.5)
-            if wav_bytes:
-                texto = transcribir_audio_es(wav_bytes)
-                if not texto:
-                    continue
 
-                dijo_jarvis = any(j in texto for j in ("jarvis", "yarvis"))
+            ahora = time.monotonic()
+            en_conversacion = (ahora < conversacion_hasta) and (not esta_en_modo_silencio())
 
-                if esta_en_modo_silencio():
-                    if any(w in texto for w in palabras_despertar_silencio) and dijo_jarvis:
-                        es_max, _, _ = verificar_hablante(wav_bytes)
-                        if es_max:
-                            resp = establecer_modo_silencio_suma(False)
-                            hablar_jarvis(resp)
-                    continue
+            if (not en_conversacion) and musica_atenuada_por_charla:
+                musica_atenuada_por_charla = False
+                ultimo_fue_invitado = False
+                _restaurar_spotify_suave_async()
+                escribir_estado_hud("EN LÍNEA", "Mark XIV Turbo | Biometría Vocal Activa")
 
-                if any(v in texto for v in palabras_disparo):
-                    es_max, score_v, det_v = verificar_hablante(wav_bytes, musica_activa=_spotify_esta_sonando())
-                    print(f"[Voz Detectada] {det_v} -> '{texto}'")
+            espera_mic = 4.2 if en_conversacion else 3.0
+            wav_bytes = grabar_frase_wav(duracion_max=9.0, espera_inicial_max=espera_mic)
 
-                    # Si había música fuerte o ruido extremo y el puntaje cayó en zona gris, pausar Spotify 2s y confirmar limpio
-                    if (not es_max) and dijo_jarvis and score_v >= 0.48 and _spotify_esta_sonando():
-                        _enviar_metodo_mpris_spotify("Pause")
-                        hablar_jarvis("Pausé un instante la música para confirmar su voz, señor. Repita su orden.", volumen_musica_durante=10, restaurar_al_100=False)
-                        wav_conf = grabar_frase_wav(duracion_max=7.5, espera_inicial_max=4.5)
-                        if wav_conf:
-                            texto_conf = transcribir_audio_es(wav_conf)
-                            es_max, score_v, det_v = verificar_hablante(wav_conf, musica_activa=False)
-                            print(f"[Biometría Re-confirmación Limpia]: {det_v} -> '{texto_conf}'")
-                            if es_max and texto_conf:
-                                texto = texto_conf
-                            else:
-                                _enviar_metodo_mpris_spotify("Play")
+            if not wav_bytes:
+                if en_conversacion and time.monotonic() >= conversacion_hasta:
+                    conversacion_hasta = 0.0
+                continue
 
-                    # Si definitivamente es otra persona: ignorar fondo o responder en Modo Invitado si dijo "Jarvis"
-                    if not es_max:
-                        if dijo_jarvis:
-                            ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
-                            resp_inv = responder_a_invitado_sin_privilegios(texto, score_v)
-                            hablar_jarvis(resp_inv)
-                        continue
+            texto, es_max, score_v, det_v, mus_sonando = _analizar_audio_en_paralelo(wav_bytes)
+            if not texto:
+                continue
 
-                    ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
-                    limpio = texto.replace("jarvis", "").replace("yarvis", "").strip(" ,.")
-                    if len(limpio) < 3:
-                        prompt_c = elegir_frase_sin_repetir(
-                            [f"Dígame, {NOMBRE_USUARIO}.", "A sus órdenes, Max.", f"Lo escucho, {NOMBRE_USUARIO}."],
-                            "ultimo_prompt_corto",
-                        )
-                        hablar_jarvis(prompt_c, volumen_musica_durante=20, restaurar_al_100=False)
-                        wav2 = grabar_frase_wav(duracion_max=16.0, espera_inicial_max=6.0)
-                        if wav2:
-                            texto2 = transcribir_audio_es(wav2)
-                            if texto2:
-                                es_max_2, score_2, det_2 = verificar_hablante(wav2)
-                                print(f"[Biometría 2do Turno]: {det_2} -> '{texto2}'")
-                                if not es_max_2:
-                                    hablar_jarvis(responder_a_invitado_sin_privilegios(texto2, score_2))
-                                    continue
-                                texto = texto2
-                    respuesta, seguir = cerebro.procesar_instruccion(texto)
-                    if "?" in respuesta and seguir:
-                        hablar_y_escuchar_replica_autonoma(respuesta)
+            dijo_jarvis = any(j in texto for j in ("jarvis", "yarvis"))
+
+            if esta_en_modo_silencio():
+                if any(w in texto for w in palabras_despertar_silencio) and dijo_jarvis and es_max:
+                    resp = establecer_modo_silencio_suma(False)
+                    hablar_jarvis(resp)
+                continue
+
+            activar_turno = en_conversacion or any(v in texto for v in palabras_disparo)
+            if not activar_turno:
+                continue
+
+            print(f"[Voz {'CHARLA' if en_conversacion else 'DISPARO'}] {det_v} -> '{texto}'")
+
+            # Re-confirmación rápida si Spotify estaba muy fuerte y cayó en zona dudosa
+            if (not es_max) and (dijo_jarvis or (en_conversacion and not ultimo_fue_invitado)) and score_v >= 0.48 and mus_sonando:
+                _enviar_metodo_mpris_spotify("Pause")
+                hablar_jarvis("Pausé un segundo la música para confirmar su voz. Dígame.", volumen_musica_durante=10, restaurar_al_100=False)
+                time.sleep(0.12)
+                wav_conf = grabar_frase_wav(duracion_max=7.0, espera_inicial_max=4.0)
+                if wav_conf:
+                    texto_conf, es_max, score_v, det_v, _ = _analizar_audio_en_paralelo(wav_conf)
+                    print(f"[Biometría Confirmación]: {det_v} -> '{texto_conf}'")
+                    if es_max and texto_conf:
+                        texto = texto_conf
                     else:
-                        hablar_jarvis(respuesta)
-                    if not seguir:
-                        break
-                else:
-                    escribir_estado_hud("EN LÍNEA", "Mark XVI en línea | Biometría Vocal Activa")
+                        _enviar_metodo_mpris_spotify("Play")
+
+            # BLOQUEO ESTRICTO PARA OTRAS PERSONAS (solo charla, jamás comandos del sistema)
+            if not es_max:
+                if dijo_jarvis or (en_conversacion and ultimo_fue_invitado):
+                    ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
+                    resp_inv = responder_a_invitado_sin_privilegios(texto, score_v)
+                    hablar_jarvis(resp_inv, volumen_musica_durante=VOLUMEN_MUSICA_COMANDO_PCT, restaurar_al_100=False)
+                    ultimo_fue_invitado = True
+                    musica_atenuada_por_charla = True
+                    conversacion_hasta = time.monotonic() + 10.0
+                    time.sleep(0.14)
+                continue
+
+            # ES MAX (AUTORIZADO)
+            ultimo_fue_invitado = False
+            ajustar_volumen_spotify(VOLUMEN_MUSICA_COMANDO_PCT)
+
+            # Si Max se despide de la charla actual, cerrar ventana fluida de inmediato
+            if en_conversacion and any(c in texto for c in palabras_cierre_charla) and len(texto.split()) <= 5:
+                conversacion_hasta = 0.0
+                musica_atenuada_por_charla = False
+                hablar_jarvis("A sus órdenes, señor. Aquí sigo pendiente.", restaurar_al_100=True)
+                continue
+
+            limpio = texto.replace("jarvis", "").replace("yarvis", "").strip(" ,.")
+            if len(limpio) < 3:
+                prompt_c = elegir_frase_sin_repetir(
+                    [f"Dígame, {NOMBRE_USUARIO}.", "A sus órdenes, Max.", "Lo escucho, señor."],
+                    "ultimo_prompt_corto",
+                )
+                hablar_jarvis(prompt_c, volumen_musica_durante=20, restaurar_al_100=False)
+                conversacion_hasta = time.monotonic() + VENTANA_CONVERSACION_S
+                musica_atenuada_por_charla = True
+                time.sleep(0.14)
+                continue
+
+            respuesta, seguir = cerebro.procesar_instruccion(texto)
+            es_orden_musica = any(k in texto for k in palabras_musica_activa)
+
+            if not seguir:
+                hablar_jarvis(respuesta, restaurar_al_100=True)
+                break
+
+            if es_orden_musica:
+                hablar_jarvis(respuesta, volumen_musica_durante=20, restaurar_al_100=True)
+                conversacion_hasta = 0.0
+                musica_atenuada_por_charla = False
+            else:
+                hablar_jarvis(respuesta, volumen_musica_durante=20, restaurar_al_100=False)
+                conversacion_hasta = time.monotonic() + VENTANA_CONVERSACION_S
+                musica_atenuada_por_charla = True
+                escribir_estado_hud("ESCUCHANDO", "Charla fluida activa (hable sin decir Jarvis)...")
+                time.sleep(0.14)
+
         except Exception:
-            time.sleep(1.5)
+            time.sleep(0.5)
+
 
 
 # =====================================================================
@@ -2357,93 +2460,192 @@ def ejecutar_protocolo_inicio() -> None:
         time.sleep(0.2)
 
 
-def iniciar_escucha_palmadas() -> None:
-    block_size = int(SAMPLE_RATE * BLOCK_DURATION)
-    bloqueo_confirmado = False
-    if BLOQUEAR_AL_ARRANCAR:
-        bloqueo_confirmado = asegurar_pantalla_bloqueada_al_inicio()
+def _escuchar_doble_palmada_nativa(modo_prueba: bool = False, verificar_bloqueo: bool = False) -> str:
+    """
+    Detector híbrido: disparo rápido por cresta + confirmación con Red Neuronal PyTorch (JarvisAudioCNN).
+    Si aún no existe el modelo .pt entrenado, opera normalmente con la lógica DSP clásica.
+    """
+    blk_dur = 0.04
+    block_size = int(SAMPLE_RATE * blk_dur)
+    bloqueo_confirmado = pantalla_esta_bloqueada() if verificar_bloqueo else False
+    ring_1s = collections.deque(maxlen=25)  # 25 * 0.04s = 1.00 s para PyTorch
 
-    # Lanzar el HUD desde el inicio para que esté listo apenas se desbloquee
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=block_size) as stream:
+        hist_pico = collections.deque(maxlen=40)
+        hist_rms = collections.deque(maxlen=40)
+
+        for _ in range(25):
+            datos, _ = stream.read(block_size)
+            x = datos.reshape(-1).astype(np.float32)
+            ring_1s.append(x)
+            hist_pico.append(float(np.max(np.abs(x))))
+            hist_rms.append(float(np.sqrt(np.mean(x * x))))
+
+        if modo_prueba:
+            dev_info = sd.query_devices(kind="input")
+            print(f"[Dispositivo]: {dev_info['name']}")
+            print(f"[Núcleo NN]  : {info_nucleo_neuronal()}")
+            print(f"[Calibración]: ruido_pico={np.median(hist_pico):.4f} | ruido_rms={np.median(hist_rms):.4f}")
+
+        tiempos_palmadas = []
+        ultima_deteccion = 0.0
+        ultimo_chequeo_lock = time.monotonic()
+        vu_count = 0
+        vu_pico = 0.0
+        vu_crest = 0.0
+
+        while True:
+            datos, _ = stream.read(block_size)
+            x = datos.reshape(-1).astype(np.float32)
+            ring_1s.append(x)
+            pico = float(np.max(np.abs(x)))
+            rms = float(np.sqrt(np.mean(x * x)))
+            crest = pico / (rms + 1e-6)
+            ahora = time.monotonic()
+
+            if verificar_bloqueo and (ahora - ultimo_chequeo_lock) >= 0.5:
+                ultimo_chequeo_lock = ahora
+                esta_lock = pantalla_esta_bloqueada()
+                if esta_lock:
+                    bloqueo_confirmado = True
+                elif not bloqueo_confirmado and BLOQUEAR_AL_ARRANCAR:
+                    ejecutar_seguro(["sudo", "-n", "/usr/bin/loginctl", "lock-sessions"])
+                    ejecutar_seguro([
+                        "gdbus", "call", "--session",
+                        "--dest", "org.gnome.ScreenSaver",
+                        "--object-path", "/org/gnome/ScreenSaver",
+                        "--method", "org.gnome.ScreenSaver.Lock",
+                    ])
+                elif bloqueo_confirmado and not esta_lock:
+                    return "UNLOCKED_MANUAL"
+
+            ruido_pico = float(np.median(hist_pico)) if hist_pico else 0.015
+            ruido_rms = float(np.median(hist_rms)) if hist_rms else 0.008
+            umbral_pico = max(0.11, ruido_pico * 3.0)
+
+            if modo_prueba:
+                if pico > vu_pico:
+                    vu_pico = pico
+                    vu_crest = crest
+                vu_count += 1
+                if vu_count % 5 == 0:
+                    barras = "#" * min(25, int(vu_pico * 35))
+                    print(
+                        f"\r[Mic] pico={vu_pico:.3f} (umb {umbral_pico:.3f}) | crest={vu_crest:.1f} [{barras:<25}]",
+                        end="",
+                        flush=True,
+                    )
+                    vu_pico = 0.0
+                    vu_crest = 0.0
+
+            if pico >= umbral_pico and crest >= 2.2 and (ahora - ultima_deteccion) >= 0.15:
+                # Leer 2 bloques más (0.08 s) para incluir la cola completa de la palmada en la ventana neuronal
+                for _ in range(2):
+                    d_ext, _ = stream.read(block_size)
+                    ring_1s.append(d_ext.reshape(-1).astype(np.float32))
+
+                etiqueta_nn = ""
+                es_falso_positivo_nn = False
+                if len(ring_1s) == 25:
+                    res_nn = predecir_ventana_audio(np.concatenate(list(ring_1s)))
+                    if res_nn:
+                        p_clap = res_nn["probs"].get("palmada", 0.0)
+                        etiqueta_nn = f" | PyTorch={res_nn['clase']}({res_nn['confianza']*100:.0f}%, clap={p_clap*100:.0f}%, {res_nn['latencia_ms']}ms)"
+                        if res_nn["clase"] in ("falso_golpe_o_voz", "ruido_ambiente") and res_nn["confianza"] >= 0.72 and p_clap < 0.22:
+                            es_falso_positivo_nn = True
+
+                if es_falso_positivo_nn:
+                    if modo_prueba:
+                        print(f"\n  [Rechazado por PyTorch CNN]{etiqueta_nn}")
+                    ultima_deteccion = time.monotonic()
+                    continue
+
+                ultima_deteccion = ahora
+                tiempos_palmadas = [t for t in tiempos_palmadas if (ahora - t) <= 0.90]
+                tiempos_palmadas.append(ahora)
+
+                if modo_prueba:
+                    print(f"\n  [Palmada #{len(tiempos_palmadas)}] pico={pico:.3f} | crest={crest:.1f}{etiqueta_nn}")
+
+                if len(tiempos_palmadas) >= 2:
+                    gap = tiempos_palmadas[-1] - tiempos_palmadas[-2]
+                    if 0.15 <= gap <= 0.90:
+                        stream.read(int(SAMPLE_RATE * 0.08))
+                        post, _ = stream.read(int(SAMPLE_RATE * 0.14))
+                        rms_post = float(np.sqrt(np.mean(np.square(post))))
+                        if rms_post < max(0.10, ruido_rms * 4.5):
+                            if modo_prueba:
+                                print(f"\n>>> [OK] ¡DOBLE PALMADA CONFIRMADA POR PYTORCH! (intervalo={gap:.2f}s) <<<\n")
+                            else:
+                                print(f"[J.A.R.V.I.S.] ¡Doble palmada confirmada! (gap={gap:.2f}s){etiqueta_nn}")
+                            return "CLAP"
+                        else:
+                            if modo_prueba:
+                                print(f"  [Descartado por sonido continuo posterior: rms={rms_post:.3f}]")
+                            tiempos_palmadas.clear()
+            elif pico < umbral_pico * 0.7:
+                hist_pico.append(pico)
+                hist_rms.append(rms)
+
+
+
+def iniciar_escucha_palmadas() -> None:
+    if BLOQUEAR_AL_ARRANCAR:
+        asegurar_pantalla_bloqueada_al_inicio()
+
     lanzar_hud_holografico(animacion="NORMAL", fullscreen=False)
 
     while True:
         try:
-            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=block_size) as stream:
-                print("[J.A.R.V.I.S.] Estabilizando micrófono (2.5s)...")
-                for _ in range(int(2.5 / BLOCK_DURATION)):
-                    stream.read(block_size)
-
-                print("[J.A.R.V.I.S.] Esperando 2 palmadas para iniciar Protocolo Showstopper...")
-                historial_ruido = collections.deque(maxlen=25)
-                for _ in range(25):
-                    historial_ruido.append(0.02)
-
-                en_impulso = False
-                bloques_impulso = 0
-                bloques_silencio = MIN_SILENCE_BLOCKS
-                tiempos_palmadas = []
-                ultimo_chequeo_lock = time.monotonic()
-
-                while True:
-                    datos, _ = stream.read(block_size)
-                    pico = float(np.max(np.abs(datos)))
-                    ahora = time.monotonic()
-
-                    if (ahora - ultimo_chequeo_lock) >= 0.5:
-                        ultimo_chequeo_lock = ahora
-                        esta_lock = pantalla_esta_bloqueada()
-                        if esta_lock:
-                            bloqueo_confirmado = True
-                        elif not bloqueo_confirmado and BLOQUEAR_AL_ARRANCAR:
-                            # Si GNOME tardó en bloquearse al encender la laptop, reintentar bloqueo suave
-                            ejecutar_seguro(["sudo", "-n", "/usr/bin/loginctl", "lock-sessions"])
-                            ejecutar_seguro([
-                                "gdbus", "call", "--session",
-                                "--dest", "org.gnome.ScreenSaver",
-                                "--object-path", "/org/gnome/ScreenSaver",
-                                "--method", "org.gnome.ScreenSaver.Lock",
-                            ])
-                        elif bloqueo_confirmado and not esta_lock:
-                            # La pantalla SÍ estuvo bloqueada y el usuario escribió su contraseña manualmente
-                            print("[J.A.R.V.I.S.] Desbloqueo manual con contraseña detectado. Activando centinela y HUD.")
-                            bucle_comandos_voz_post_inicio()
-                            return
-
-                    ruido_base = float(np.median(historial_ruido)) if historial_ruido else 0.02
-                    umbral_dinamico = max(CLAP_THRESHOLD, ruido_base * CREST_FACTOR_MIN)
-
-                    if pico >= umbral_dinamico:
-                        en_impulso = True
-                        bloques_impulso += 1
-                    else:
-                        if en_impulso:
-                            if 1 <= bloques_impulso <= MAX_CLAP_BLOCKS and bloques_silencio >= MIN_SILENCE_BLOCKS:
-                                tiempos_palmadas = [t for t in tiempos_palmadas if (ahora - t) <= MAX_GAP_SECONDS]
-                                tiempos_palmadas.append(ahora)
-                                if len(tiempos_palmadas) >= 2:
-                                    intervalo = tiempos_palmadas[-1] - tiempos_palmadas[-2]
-                                    if MIN_GAP_SECONDS <= intervalo <= MAX_GAP_SECONDS:
-                                        datos_post, _ = stream.read(int(SAMPLE_RATE * 0.16))
-                                        if float(np.max(np.abs(datos_post))) < SILENCE_THRESHOLD:
-                                            print("[J.A.R.V.I.S.] ¡Doble palmada confirmada! Iniciando música...")
-                                            ejecutar_protocolo_inicio()
-                                            bucle_comandos_voz_post_inicio()
-                                            return
-                                        else:
-                                            tiempos_palmadas.clear()
-                            else:
-                                tiempos_palmadas.clear()
-                            en_impulso = False
-                            bloques_impulso = 0
-                            bloques_silencio = 0
-
-                        if pico < SILENCE_THRESHOLD:
-                            bloques_silencio += 1
-                            historial_ruido.append(pico)
-                        else:
-                            bloques_silencio = 0
+            print("[J.A.R.V.I.S.] Esperando 2 palmadas...")
+            resultado = _escuchar_doble_palmada_nativa(modo_prueba=False, verificar_bloqueo=True)
+            if resultado == "CLAP":
+                ejecutar_protocolo_inicio()
+                bucle_comandos_voz_post_inicio()
+                return
+            if resultado == "UNLOCKED_MANUAL":
+                print("[J.A.R.V.I.S.] Desbloqueo manual detectado. Activando centinela y HUD.")
+                bucle_comandos_voz_post_inicio()
+                return
         except Exception:
             time.sleep(2.0)
+
+
+def probar_detector_palmadas() -> None:
+    print("\n============================================================")
+    print("  PRUEBA EN VIVO DE DOBLE PALMADA (AUDIO NATIVO)")
+    print("============================================================")
+    print("Aplaude 2 veces a tu distancia normal de la laptop...\n")
+    _escuchar_doble_palmada_nativa(modo_prueba=True, verificar_bloqueo=False)
+
+
+
+def probar_velocidad_respuesta() -> None:
+    print("\n============================================================")
+    print("  TEST DE LATENCIA MARK XIV TURBO (Habla una pregunta ahora)")
+    print("============================================================")
+    cerebro = OrquestadorJarvis(sys.modules[__name__])
+    t0 = time.monotonic()
+    wav = grabar_frase_wav(duracion_max=8.0, espera_inicial_max=5.0)
+    if not wav:
+        print("[!] No se detectó voz.")
+        return
+    t_rec = time.monotonic()
+    texto, es_max, score, det, _ = _analizar_audio_en_paralelo(wav)
+    t_stt = time.monotonic()
+    print(f"[1] STT + Biometría paralela: {(t_stt - t_rec)*1000:.0f} ms | Texto: '{texto}' | {det}")
+    if not texto:
+        return
+    if es_max:
+        resp, _ = cerebro.procesar_instruccion(texto)
+    else:
+        resp = responder_a_invitado_sin_privilegios(texto, score)
+    t_llm = time.monotonic()
+    print(f"[2] Cerebro/Acción:           {(t_llm - t_stt)*1000:.0f} ms | Resp: '{resp}'")
+    hablar_jarvis(resp, restaurar_al_100=False)
+    t_fin = time.monotonic()
+    print(f"[3] Habla total en pipeline:  {(t_fin - t_llm)*1000:.0f} ms")
+    print("============================================================\n")
 
 
 if __name__ == "__main__":
@@ -2460,6 +2662,10 @@ if __name__ == "__main__":
         establecer_modo_silencio_suma(True)
     elif len(sys.argv) > 1 and sys.argv[1] == "--unmute":
         establecer_modo_silencio_suma(False)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-velocidad":
+        probar_velocidad_respuesta()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--test-palmadas":
+        probar_detector_palmadas()
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-spotify":
         ejecutar_protocolo_inicio()
     elif len(sys.argv) > 1 and sys.argv[1] == "--test-autonomia":
